@@ -9,6 +9,8 @@ class ECGSQAEngine:
     HR_MIN         = 24     # BPM lower bound (Stage 3)
     HR_MAX         = 240    # BPM upper bound (Stage 3)
     QRS_COV_THRESH = 0.90   # max coefficient of variation of R-peak amplitudes
+    ISCORE_L1      = 0.50   # iScore below this → Unacceptable
+    ISCORE_L2      = 0.80   # iScore above this → Diagnostic quality (else HR quality)
 
     def __init__(self, processor):
         """
@@ -117,6 +119,76 @@ class ECGSQAEngine:
 
         return True, mean_hr, cov, "OK"
 
+    # ── Stage 4 ───────────────────────────────────────────────────────
+
+    def compute_iscore(self, peaks, hr_info):
+        """Beats' Average Correlation Algorithm.
+
+        Steps
+        -----
+        1. β = min(mean(RR_samples), median(RR_samples))  (in samples)
+           half_win = round(β / 2)
+        2. Extract a half_win-sized window centred on each R-peak → QRS_complexes
+        3. M_x = corrcoef(QRS_complexes)   – (n_beats × n_beats) intercorrelation matrix
+        4. G_x = mean(M_x, axis=1)         – average intercorrelation per beat
+        5. iScore = mean(G_x)
+
+        Parameters
+        ----------
+        peaks   : ndarray – R-peak sample indices
+        hr_info : dict    – output of ECGProcessor.compute_hr()
+
+        Returns
+        -------
+        iscore : float
+            Signal quality index in [−1, 1].  Higher means more morphology
+            consistency across beats.
+        M_x : ndarray or None
+            (n_beats × n_beats) intercorrelation coefficient matrix.
+        G_x : ndarray or None
+            (n_beats,) average intercorrelation per beat.
+        """
+        if len(peaks) < 2:
+            return 0.0, None, None
+
+        rr = hr_info.get("rr_intervals", np.array([]))
+        if len(rr) == 0:
+            return 0.0, None, None
+
+        # β in samples
+        rr_samp = rr * self.processor.fs
+        beta     = int(round(min(float(np.mean(rr_samp)),
+                                 float(np.median(rr_samp)))))
+        half_win = beta // 2
+
+        ecg = self.processor.filtered
+        n   = len(ecg)
+
+        # Extract fixed-length windows centred on each R-peak (skip boundary peaks)
+        qrs_list = []
+        valid_pk = []
+        for pk in peaks:
+            s = int(pk) - half_win
+            e = int(pk) + half_win
+            if s >= 0 and e <= n:
+                qrs_list.append(ecg[s:e])
+                valid_pk.append(pk)
+
+        if len(qrs_list) < 2:
+            return 0.0, None, None
+
+        win_len = min(len(q) for q in qrs_list)
+        Q = np.array([q[:win_len] for q in qrs_list])   # (n_beats, win_len)
+
+        # Intercorrelation matrix
+        M_x = np.corrcoef(Q)                            # (n_beats, n_beats)
+
+        # Average intercorrelation per beat
+        G_x = np.mean(M_x, axis=1)                      # (n_beats,)
+
+        iscore = float(np.mean(G_x))
+        return iscore, M_x, G_x
+
     # ── Full pipeline ─────────────────────────────────────────────────
 
     def assess(self, wavelet_params=None):
@@ -167,6 +239,10 @@ class ECGSQAEngine:
             "hr_info":         None,
             "mean_hr":         None,
             "amp_cov":         None,
+            "iscore":          None,
+            "iscore_quality":  None,   # "hr" | "diag" | "bad"
+            "M_x":             None,
+            "G_x":             None,
         }
 
         # ── Stage 1: flat line / saturation ──────────────────────────
@@ -203,8 +279,32 @@ class ECGSQAEngine:
         if not passes:
             result["label"] = (
                 f"Unacceptable \u2013 QRS / HR Check Failed\n({note})")
+            return result
+
+        # ── Stage 4: Beats' Average Correlation ──────────────────────
+        result["stage_reached"] = 4
+        iscore, M_x, G_x = self.compute_iscore(peaks, hr_info)
+        result.update(iscore=iscore, M_x=M_x, G_x=G_x)
+
+        if iscore < self.ISCORE_L1:
+            result["iscore_quality"] = "bad"
+            result["label"] = (
+                f"Unacceptable \u2013 Low Beat Morphology Consistency\n"
+                f"(iScore = {iscore:.3f} < L1 = {self.ISCORE_L1})"
+            )
+        elif iscore < self.ISCORE_L2:
+            result["quality"]        = "acceptable"
+            result["iscore_quality"] = "hr"
+            result["label"] = (
+                f"Acceptable \u2013 HR Quality\n"
+                f"(iScore = {iscore:.3f}, L1 \u2264 iScore < L2)"
+            )
         else:
-            result["quality"] = "acceptable"
-            result["label"]   = "Acceptable"
+            result["quality"]        = "acceptable"
+            result["iscore_quality"] = "diag"
+            result["label"] = (
+                f"Acceptable \u2013 Diagnostic Quality\n"
+                f"(iScore = {iscore:.3f} \u2265 L2 = {self.ISCORE_L2})"
+            )
 
         return result

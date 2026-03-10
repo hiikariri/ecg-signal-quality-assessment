@@ -17,6 +17,8 @@ from PyQt5.QtGui import QFont
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+import matplotlib.cm as mpl_cm
+import matplotlib.colors as mpl_colors
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -25,8 +27,8 @@ from matplotlib.figure import Figure
 
 class SQACanvas(FigureCanvas):
     def __init__(self, parent=None):
-        self.fig  = Figure(figsize=(12, 9), tight_layout=True)
-        self.axes = self.fig.subplots(3, 1, sharex=False)
+        self.fig  = Figure(figsize=(12, 12), tight_layout=True)
+        self.axes = self.fig.subplots(4, 1, sharex=False)
         super().__init__(self.fig)
 
 
@@ -152,10 +154,26 @@ class SQAWindow(QMainWindow):
         self.dspin_cov.setValue(0.90)
         grid.addWidget(self.dspin_cov, 4, 1)
 
+        grid.addWidget(QLabel("iScore L1 (HR/bad):"), 5, 0)
+        self.dspin_l1 = QDoubleSpinBox()
+        self.dspin_l1.setRange(0.01, 0.99)
+        self.dspin_l1.setSingleStep(0.05)
+        self.dspin_l1.setDecimals(2)
+        self.dspin_l1.setValue(0.50)
+        grid.addWidget(self.dspin_l1, 5, 1)
+
+        grid.addWidget(QLabel("iScore L2 (diag):"), 6, 0)
+        self.dspin_l2 = QDoubleSpinBox()
+        self.dspin_l2.setRange(0.01, 0.99)
+        self.dspin_l2.setSingleStep(0.05)
+        self.dspin_l2.setDecimals(2)
+        self.dspin_l2.setValue(0.80)
+        grid.addWidget(self.dspin_l2, 6, 1)
+
         self.btn_assess = QPushButton("\u25b6  Run SQA")
         self.btn_assess.setEnabled(False)
         self.btn_assess.clicked.connect(self._on_assess)
-        grid.addWidget(self.btn_assess, 5, 0, 1, 2)
+        grid.addWidget(self.btn_assess, 7, 0, 1, 2)
 
         grp.setLayout(grid)
         return grp
@@ -193,6 +211,9 @@ class SQAWindow(QMainWindow):
             ("Stage 3 \u2013 QRS/HR:",   "s3"),
             ("  Mean HR:",               "mean_hr"),
             ("  QRS amp CoV:",           "amp_cov"),
+            ("Stage 4 \u2013 Morphology:","s4"),
+            ("  iScore:",                "iscore_val"),
+            ("  Quality tier:",          "iscore_tier"),
         ]
 
         self.slbl = {}
@@ -265,6 +286,8 @@ class SQAWindow(QMainWindow):
         engine.HR_MIN         = self.spin_hrmin.value()
         engine.HR_MAX         = self.spin_hrmax.value()
         engine.QRS_COV_THRESH = self.dspin_cov.value()
+        engine.ISCORE_L1      = self.dspin_l1.value()
+        engine.ISCORE_L2      = self.dspin_l2.value()
 
         self.sqa_result = engine.assess()
         self._update_panels()
@@ -321,10 +344,23 @@ class SQAWindow(QMainWindow):
             sl["mean_hr"].setText("\u2014")
             sl["amp_cov"].setText("\u2014")
 
+        # Stage 4
+        if r["stage_reached"] >= 4 and r["iscore"] is not None:
+            iq = r["iscore_quality"]
+            sl["s4"].setText(tick(iq in ("hr", "diag")))
+            sl["iscore_val"].setText(f"{r['iscore']:.4f}")
+            tier_map = {"bad": "Bad", "hr": "HR Quality", "diag": "Diagnostic"}
+            sl["iscore_tier"].setText(tier_map.get(iq, "\u2014"))
+        else:
+            sl["s4"].setText("\u2014 (not run)")
+            sl["iscore_val"].setText("\u2014")
+            sl["iscore_tier"].setText("\u2014")
+
     # ── Drawing ───────────────────────────────────────────────────────
     def _draw(self):
-        for ax in self.canvas.axes:
-            ax.cla()
+        # Clear the entire figure (removes colorbars too) and recreate axes
+        self.canvas.fig.clear()
+        self.canvas.axes = self.canvas.fig.subplots(4, 1, sharex=False)
 
         proc = self.processor
         res  = self.sqa_result
@@ -435,6 +471,75 @@ class SQAWindow(QMainWindow):
 
         ax2.set_xlabel("Time (s)")
         ax2.grid(True, alpha=0.3)
+
+        # ── Ax 3: QRS overlay + G_x per beat (Stage 4) ────────────────
+        ax3 = self.canvas.axes[3]
+        iscore = res.get("iscore")
+        G_x    = res.get("G_x")
+        M_x    = res.get("M_x")
+        peaks  = res.get("peaks")
+
+        if (res["stage_reached"] >= 4
+                and peaks is not None and len(peaks) >= 2
+                and G_x is not None):
+
+            # ─ Left (primary) axis: overlaid QRS complexes coloured by G_x ─
+            ecg     = proc.filtered
+            n_ecg   = len(ecg)
+
+            # Recreate β / half_win exactly as in compute_iscore
+            hr_info_r = res.get("hr_info", {})
+            rr        = hr_info_r.get("rr_intervals", np.array([]))
+            if len(rr) > 0:
+                rr_samp  = rr * proc.fs
+                beta     = int(round(min(float(np.mean(rr_samp)),
+                                         float(np.median(rr_samp)))))
+                half_win = beta // 2
+                offset   = np.arange(-half_win, half_win) / proc.fs * 1000  # ms
+
+                # Colour map: low G_x = red, high = green
+                g_norm = (G_x - G_x.min()) / max(float(G_x.max() - G_x.min()), 1e-9)
+                cmap   = mpl_cm.RdYlGn
+
+                idx = 0
+                for pk in peaks:
+                    s = int(pk) - half_win
+                    e = int(pk) + half_win
+                    if s >= 0 and e <= n_ecg and idx < len(G_x):
+                        win_len = len(offset)
+                        seg     = ecg[s : s + win_len]
+                        ax3.plot(offset[:len(seg)], seg,
+                                 color=cmap(g_norm[idx]), lw=0.6, alpha=0.6)
+                        idx += 1
+
+                # Colourbar
+                sm = mpl_cm.ScalarMappable(
+                    cmap=cmap,
+                    norm=mpl_colors.Normalize(vmin=G_x.min(), vmax=G_x.max()))
+                sm.set_array([])
+                self.canvas.fig.colorbar(sm, ax=ax3, fraction=0.03,
+                                         pad=0.01, label="Avg correlation (G_x)")
+
+            iq_label = {"bad": "Bad", "hr": "HR Quality",
+                        "diag": "Diagnostic", None: "N/A"}.get(
+                            res.get("iscore_quality"), "N/A")
+            s4_fail  = res["iscore_quality"] == "bad"
+            ax3.set_title(
+                f"Stage 4 \u2013 Beats' Avg Correlation   "
+                f"[iScore = {iscore:.4f}   L1={self.dspin_l1.value():.2f}  "
+                f"L2={self.dspin_l2.value():.2f}   \u2192 {iq_label}]",
+                color=RED if s4_fail else ("#1a7a1a" if iq_label == "Diagnostic" else BLACK),
+                fontweight="bold")
+            ax3.set_xlabel("Offset from R-peak (ms)")
+            ax3.set_ylabel("Amplitude (V)")
+        else:
+            stage_msg = ("not reached"
+                         if res["stage_reached"] < 4 else "insufficient peaks")
+            ax3.set_title(f"Stage 4 \u2013 Beats' Avg Correlation   [{stage_msg}]",
+                          color=GRAY, fontweight="bold")
+            ax3.set_xlabel("Offset from R-peak (ms)")
+
+        ax3.grid(True, alpha=0.3)
 
         self.canvas.draw()
 
